@@ -25,7 +25,7 @@ async function runChMode() {
 
 runChMode().catch(console.error);
 
-const defaultQuery = "SELECT $timeSeries as t, count() FROM $table WHERE $timeFilter GROUP BY t ORDER BY t";
+const defaultQuery = "SELECT $timeSeriesMs as t, count() FROM $table WHERE $timeFilter GROUP BY t ORDER BY t";
 
 class SqlQueryCtrl extends QueryCtrl {
     static templateUrl = 'partials/query.editor.html';
@@ -62,7 +62,6 @@ class SqlQueryCtrl extends QueryCtrl {
     /** @ngInject **/
     constructor($scope, $injector, templateSrv, private uiSegmentSrv, private $rootScope) {
         super($scope, $injector);
-
         this.queryModel = new SqlQuery(this.target, templateSrv, this.panel.scopedVars);
         if (this.datasource.targetsRef) {
             this.datasource.targetsRef[this.target.refId] = this.target;
@@ -98,6 +97,7 @@ class SqlQueryCtrl extends QueryCtrl {
             {text: 'Column:DateTime', value: 'DATETIME'},
             {text: 'Column:DateTime64', value: 'DATETIME64'},
             {text: 'Column:TimeStamp', value: 'TIMESTAMP'},
+            {text: 'Column:TimeStamp64', value: 'TIMESTAMP64'},
         ];
 
         this.formats = [
@@ -132,6 +132,13 @@ class SqlQueryCtrl extends QueryCtrl {
         // After migration to React - this hack will not be needed anymore, query editor refresh is bundled
         this.$rootScope.$on('clickhouse/explore/modifyQuery', this.modifyQuery.bind(this));
         this.initEditor();
+
+        this.target.promQLNameColumn = this.target.promQLNameColumn || 'name';
+        this.target.promQLValue = this.target.promQLValue || 'anyLast(value) val';
+        if (this.target.promQLModel && this.target.promQL) {
+            this.target.query = SqlQuery.promQL2Query(this.target.promQLValue, this.target.promQL);
+        }
+
     }
 
     modifyQuery(_, newQuery: any) {
@@ -215,8 +222,22 @@ class SqlQueryCtrl extends QueryCtrl {
 
     toggleEditorMode() {
         this.target.rawQuery = !this.target.rawQuery;
+        this.target.promQLModel = false;
 
         this.initEditor();
+    }
+
+    togglePromQLEditorMode() {
+        this.target.promQLModel = true;
+        this.target.rawQuery = false;
+    }
+
+    refreshPromQL() {
+        // 断是否有 promQL,如果有转换成 query
+        if (this.target.promQLModel && this.target.promQL) {
+            this.target.query = SqlQuery.promQL2Query(this.target.promQLValue || 'value', this.target.promQL);
+        }
+        this.refresh();
     }
 
     toggleEdit(e: any, editMode: boolean) {
@@ -337,6 +358,11 @@ class SqlQueryCtrl extends QueryCtrl {
         this.refresh();
     }
 
+    toPromQLMode() {
+        this.togglePromQLEditorMode();
+        this.refresh();
+    }
+
     format() {
         try {
             return this.getScanner().Format();
@@ -382,7 +408,7 @@ class SqlQueryCtrl extends QueryCtrl {
             case 'TABLES':
                 query = 'SELECT name ' +
                     'FROM system.tables ' +
-                    'WHERE database = \'' + this.target.database + '\' ' +
+                    'WHERE engine != \'ReplicatedMergeTree\' AND database = \'' + this.target.database + '\' ' +
                     'ORDER BY name';
                 break;
             case 'DATE':
@@ -416,6 +442,14 @@ class SqlQueryCtrl extends QueryCtrl {
                     'WHERE database = \'' + this.target.database + '\' AND ' +
                     'table = \'' + this.target.table + '\' AND ' +
                     'type = \'UInt32\' ' +
+                    'ORDER BY name';
+                break;
+            case 'TIMESTAMP64':
+                query = 'SELECT name ' +
+                    'FROM system.columns ' +
+                    'WHERE database = \'' + this.target.database + '\' AND ' +
+                    'table = \'' + this.target.table + '\' AND ' +
+                    'type = \'Int64\' ' +
                     'ORDER BY name';
                 break;
             case 'DATABASES':

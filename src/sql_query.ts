@@ -1,6 +1,6 @@
 ///<reference path="../node_modules/grafana-sdk-mocks/app/headers/common.d.ts" />
 
-import {each, isArray, isEmpty, isString, map} from 'lodash-es';
+import {each, isArray, isEmpty, isString, map, trimEnd} from 'lodash-es';
 import * as dateMath from 'grafana/app/core/utils/datemath';
 import moment from 'moment';
 import Scanner from './scanner';
@@ -32,6 +32,10 @@ export default class SqlQuery {
     }
 
     replace(options, adhocFilters) {
+        // 断是否有 promQL,如果有转换成 query
+        if (this.target.promQLModel && this.target.promQL) {
+            this.target.query = SqlQuery.promQL2Query(this.target.promQLValue || 'value', this.target.promQL);
+        }
         let query = this.templateSrv.replace(
             SqlQuery.conditionalTest(this.target.query.trim(), this.templateSrv), options.scopedVars, SqlQuery.interpolateQueryExpr
             ),
@@ -98,10 +102,12 @@ export default class SqlQuery {
                 query = scanner.Print(topQueryAST);
             }
 
+            topQueryAST.promQLLegend = this.target.promQLLegend;
             query = SqlQuery.applyMacros(query, topQueryAST);
         } catch (err) {
             console.error('AST parser error: ', err);
         }
+        console.log(query);
 
         /* Render the ad-hoc condition or evaluate to an always true condition */
         let renderedAdHocCondition = '1';
@@ -149,6 +155,65 @@ export default class SqlQuery {
         this.target.rawQuery = SqlQuery.replaceTimeFilters(this.target.rawQuery, this.options.range, dateTimeType, round);
 
         return this.target.rawQuery;
+    }
+
+    static promQL2Query(promQLValue: string, promQL: string): string {
+        const regex = /\b(\w+)\b(?!=\s*=)/g;
+        const custom_function = ['rate','irate','increase','ceil'];
+        const matches = promQL.match(regex);
+
+        let queryStr;
+        let template;
+
+        // todo validate matches
+        let func = '';
+        let name = '';
+        let conditions = '';
+        let time = '';
+        if (custom_function.indexOf(matches[0]) > -1) {
+            template = '${func}({promQLValue},{time}) FROM $table WHERE name = \'{name}\' and {conditions}';
+
+            func = matches[0];
+            name = matches[1];
+            time = trimEnd((matches[matches.length - 1].replace('m', '')));
+            const where = matches.slice(2, matches.length - 1);
+
+            for (let i = 0; i < where.length; i += 2) {
+                let key = where[i];
+                let value = where[i + 1];
+                console.log(key, value);
+                conditions += conditions + key + '=\'$' + value + '\' and ';
+            }
+
+        } else {
+            template = 'SELECT $timeSeriesMs as t, {promQLValue} \n' +
+                'FROM $table \n' +
+                'WHERE $timeFilter \n' +
+                'and name = \'{name}\' \n' +
+                'and {conditions} \n' +
+                'GROUP BY t ORDER BY t';
+
+            name = matches[0];
+            const where = matches.slice(1, matches.length);
+            for (let i = 0; i < where.length; i += 2) {
+                let key = where[i];
+                let value = where[i + 1];
+                conditions += conditions + key + '=\'$' + value + '\' and ';
+            }
+        }
+
+        conditions = trimEnd(conditions.trim(), 'and');
+
+        queryStr = template
+            .replace('{func}', func)
+            .replace("{promQLValue}", promQLValue)
+            .replace('{name}', name)
+            .replace('{conditions}', conditions)
+            .replace('{time}', time);
+
+        console.log(queryStr);
+
+        return queryStr;
     }
 
     static escapeIdentifier(identifier: string): string {
@@ -216,6 +281,9 @@ export default class SqlQuery {
             if (dateTimeType === 'DATETIME64') {
                 return 'toDateTime64(' + t + ', 3)';
             }
+            if (dateTimeType === 'TIMESTAMP64') {
+                return t + ' * 1000';
+            }
             return t;
         };
     }
@@ -254,6 +322,9 @@ export default class SqlQuery {
         }
         if (SqlQuery.contain(ast, '$rate')) {
             return SqlQuery.rate(query, ast);
+        }
+        if (SqlQuery.contain(ast, '$irate')) {
+            return SqlQuery.irate(query, ast);
         }
         if (SqlQuery.contain(ast, '$perSecond')) {
             return SqlQuery.perSecond(query, ast);
@@ -362,20 +433,20 @@ export default class SqlQuery {
         return fromRe.lastIndex - matches[matches.length - 1].length + fromRelativeIndex;
     }
 
-    static rate(query: string, ast: any): string {
-        let [beforeMacrosQuery, fromQuery] = SqlQuery._parseMacro('$rate', query);
+    static irate(query: string, ast: any): string {
+        let [beforeMacrosQuery, fromQuery] = SqlQuery._parseMacro('$irate', query);
         if (fromQuery.length < 1) {
             return query;
         }
-        let args = ast['$rate'];
-        if (args.length < 1) {
-            throw {message: 'Amount of arguments must be > 0 for $rate func. Parsed arguments are:  ' + args.join(', ')};
+        let args = ast['$irate'];
+        if (args.length < 2) {
+            throw {message: 'Amount of arguments must be > 1 for $irate func. Parsed arguments are:  ' + args.join(', ')};
         }
 
-        return SqlQuery._rate(args, beforeMacrosQuery, fromQuery);
+        return SqlQuery._irate(args, args.pop(), beforeMacrosQuery, fromQuery);
     }
 
-    static _rate(args, beforeMacrosQuery, fromQuery: string): string {
+    static _irate(args, time: number, beforeMacrosQuery, fromQuery: string): string {
         let aliases = [];
         each(args, function (arg) {
             if (arg.slice(-1) === ')') {
@@ -386,7 +457,57 @@ export default class SqlQuery {
 
         let cols = [];
         each(aliases, function (a) {
-            cols.push(a + '/runningDifference(t/1000) ' + a + 'Rate');
+            cols.push('((' + a + ' - neighbor(' + a + ', -1 ,' + a + '))/((t - neighbor(t, -1 , 1)) / 1000)) ' + a + '_iRate');
+        });
+
+        fromQuery = SqlQuery._applyTimeFilter(fromQuery);
+        return beforeMacrosQuery + 'SELECT ' +
+            't,' +
+            ' ' + cols.join(', ') +
+            ' FROM (' +
+            ' SELECT $timeSeriesMs AS t' +
+            ', ' + args.join(', ') +
+            ' ' + fromQuery +
+            ' ORDER BY t' +
+            ')';
+    }
+
+    static rate(query: string, ast: any): string {
+        let [beforeMacrosQuery, fromQuery] = SqlQuery._parseMacro('$rate', query);
+        if (fromQuery.length < 1) {
+            return query;
+        }
+        let args = ast['$rate'];
+        let promQLLegend = ast['promQLLegend'];
+        if (args.length < 2) {
+            throw {message: 'Amount of arguments must be > 1 for $rate func. Parsed arguments are:  ' + args.join(', ')};
+        }
+
+        return SqlQuery._rate(args, args.pop(),promQLLegend, beforeMacrosQuery, fromQuery);
+    }
+
+    static _rate(args, time: number, promQLLegend: string, beforeMacrosQuery, fromQuery: string): string {
+        if (promQLLegend === null) {
+            promQLLegend = '';
+        } else {
+            promQLLegend += ', ';
+        }
+        let aliases = [];
+        each(args, function (arg) {
+            if (arg.slice(-1) === ')') {
+                throw {message: 'Argument "' + arg + '" cant be used without alias'};
+            }
+            aliases.push(arg.trim().split(' ').pop());
+        });
+
+        let cols = [];
+        each(aliases, function (a) {
+            // cols.push('((' + a + ' - neighbor(' + a + ',' + -time + ',' + a + '))/((t - neighbor(t, ' + -time + ', 1)) / 1000)) ' + a + '_Rate');
+            if (promQLLegend !== '') {
+                cols.push('array((' + promQLLegend + '((' + a + ' - neighbor(' + a + ',' + -time + ',' + a + '))/((t - neighbor(t, ' + -time + ', 1)) / 1000))))');
+            } else {
+                cols.push('((' + a + ' - neighbor(' + a + ',' + -time + ',' + a + '))/((t - neighbor(t, ' + -time + ', 1)) / 1000)) `value`');
+            }
         });
 
         fromQuery = SqlQuery._applyTimeFilter(fromQuery);
@@ -395,9 +516,8 @@ export default class SqlQuery {
             ' ' + cols.join(', ') +
             ' FROM (' +
             ' SELECT $timeSeries AS t' +
-            ', ' + args.join(', ') +
+            ', ' + promQLLegend + args.join(', ') +
             ' ' + fromQuery +
-            ' GROUP BY t' +
             ' ORDER BY t' +
             ')';
     }
@@ -580,21 +700,23 @@ export default class SqlQuery {
             return query;
         }
         let args = ast['$increase'];
-        if (args.length < 1) {
-            throw {message: 'Amount of arguments must be > 0 for $increase func. Parsed arguments are:  ' + args.join(', ')};
+        if (args.length < 2) {
+            throw {message: 'Amount of arguments must be > 1 for $increase func. Parsed arguments are:  ' + args.join(', ')};
         }
-
-        each(args, function (a, i) {
-            args[i] = 'max(' + a.trim() + ') AS max_' + i;
-        });
-
-        return SqlQuery._increase(args, beforeMacrosQuery, fromQuery);
+        return SqlQuery._increase(args, args.pop(), beforeMacrosQuery, fromQuery);
     }
 
-    static _increase(args, beforeMacrosQuery, fromQuery: string): string {
+    static _increase(args, time: number, beforeMacrosQuery, fromQuery: string): string {
+        let aliases = [];
+        each(args, function (arg) {
+            if (arg.slice(-1) === ')') {
+                throw {message: 'Argument "' + arg + '" cant be used without alias'};
+            }
+            aliases.push(arg.trim().split(' ').pop());
+        });
         let cols = [];
-        each(args, function (a, i) {
-            cols.push('if(runningDifference(max_' + i + ') < 0, 0, runningDifference(max_' + i + ')) AS max_' + i + '_Increase');
+        each(aliases, function (a) {
+            cols.push(a + ' - neighbor(' + a + ',' + -time + ',' + a + ') ' + a + '_Increase');
         });
 
         fromQuery = SqlQuery._applyTimeFilter(fromQuery);
@@ -602,10 +724,9 @@ export default class SqlQuery {
             't,' +
             ' ' + cols.join(', ') +
             ' FROM (' +
-            ' SELECT $timeSeries AS t,' +
+            ' SELECT $timeSeriesMs AS t,' +
             ' ' + args.join(', ') +
             ' ' + fromQuery +
-            ' GROUP BY t' +
             ' ORDER BY t' +
             ')';
     }
@@ -688,6 +809,10 @@ export default class SqlQuery {
                 return 'toUInt32(toDateTime(toStartOfQuarter($dateTimeCol))) * 1000';
             }
         }
+
+        if (dateTimeType === 'TIMESTAMP64') {
+            return '(intDiv($dateTimeCol, $interval) * $interval)';
+        }
         return '(intDiv($dateTimeCol, $interval) * $interval) * 1000';
     }
 
@@ -697,6 +822,9 @@ export default class SqlQuery {
         }
         if (dateTimeType === 'DATETIME64') {
             return '(intDiv(toFloat64($dateTimeCol) * 1000, ($interval * 1000)) * ($interval * 1000))';
+        }
+        if (dateTimeType === 'TIMESTAMP64') {
+            return '(intDiv($dateTimeCol, $interval) * $interval)';
         }
         return '(intDiv($dateTimeCol, $interval) * $interval) * 1000';
     }
@@ -723,6 +851,9 @@ export default class SqlQuery {
             if (dateTimeType === 'DATETIME64') {
                 return 'toDateTime64(' + t + ', 3)';
             }
+            if (dateTimeType === 'TIMESTAMP64') {
+                return '(' + t + ' * 1000)';
+            }
             return t;
         };
         return '$dateTimeCol >= ' + convertFn('$from') + ' AND $dateTimeCol <= ' + convertFn('$to');
@@ -735,6 +866,9 @@ export default class SqlQuery {
             }
             if (dateTimeType === 'DATETIME64') {
                 return 'toDateTime64(' + t + ', 3)';
+            }
+            if (dateTimeType === 'TIMESTAMP64') {
+                return '(' + t + ' * 1000)';
             }
             return '(' + t + ')';
         };

@@ -248,6 +248,10 @@ func (q *EvalQuery) getConvertFn(dateTimeType string) func(string) string {
 		if dateTimeType == "DATETIME64" {
 			return "toDateTime64(" + t + ", 3)"
 		}
+
+		if dateTimeType == "TIMESTAMP64" {
+			return t + " * 1000"
+		}
 		return t
 	}
 }
@@ -261,6 +265,12 @@ func (q *EvalQuery) applyMacros(query string, ast *EvalAST) (string, error) {
 	}
 	if q.contain(ast, "$rate") {
 		return q.rate(query, ast)
+	}
+	if q.contain(ast, "$irateColumns") {
+		return q.irateColumns(query, ast)
+	}
+	if q.contain(ast, "$irate") {
+		return q.irate(query, ast)
 	}
 	if q.contain(ast, "$perSecond") {
 		return q.perSecond(query, ast)
@@ -317,6 +327,39 @@ func (q *EvalQuery) columns(query string, ast *EvalAST) (string, error) {
 	return q._columns(args[0].(string), args[1].(string), beforeMacrosQuery, fromQuery)
 }
 
+func (q *EvalQuery) _irateColumns(key, value, beforeMacrosQuery, fromQuery string) (string, error) {
+	if key[len(key)-1] == ')' || value[len(value)-1] == ')' {
+		return "", fmt.Errorf("some of passed arguments are without aliases: %s, %s", key, value)
+	}
+	var keySplit = strings.Split(strings.Trim(key, " \xA0\t\r\n"), " ")
+	var keyAlias = keySplit[len(keySplit)-1]
+	var valueSplit = strings.Split(strings.Trim(value, " \xA0\t\r\n"), " ")
+	var valueAlias = valueSplit[len(valueSplit)-1]
+	var havingIndex = strings.Index(strings.ToLower(fromQuery), "having")
+	var having = ""
+
+	if havingIndex != -1 {
+		having = " " + fromQuery[havingIndex:]
+		fromQuery = fromQuery[0 : havingIndex-1]
+	}
+	fromQuery = q._applyTimeFilter(fromQuery)
+	var col = "(" + valueAlias + " - neighbor(" + valueAlias + ",-1," + valueAlias + "))/((t - neighbor(t,-1,1)) / 1000" + valueAlias
+	return beforeMacrosQuery + "SELECT" +
+		" t," +
+		" groupArray((" + key + ", " + valueAlias + ")) AS groupArr" +
+		"FROM (SELECT t," + keyAlias + ", " + col +
+		" FROM (" +
+		" SELECT $timeSeriesMs AS t" +
+		", " + key +
+		", " + value + " " +
+		fromQuery +
+		" GROUP BY t, " + keyAlias +
+		having +
+		" ORDER BY t ))" +
+		" GROUP BY t" +
+		" ORDER BY t", nil
+}
+
 func (q *EvalQuery) _columns(key, value, beforeMacrosQuery, fromQuery string) (string, error) {
 	if key[len(key)-1] == ')' || value[len(value)-1] == ')' {
 		return "", fmt.Errorf("some of passed arguments are without aliases: %s, %s", key, value)
@@ -355,24 +398,74 @@ func (q *EvalQuery) rateColumns(query string, ast *EvalAST) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	beforeMacrosQuery, fromQuery := macroQueries[0], macroQueries[1]
+	fromQuery := macroQueries[1]
 	if len(fromQuery) < 1 {
 		return query, nil
 	}
 	var args = ast.Obj["$rateColumns"].(*EvalAST).Arr
-	if args == nil || len(args) != 2 {
-		return "", fmt.Errorf("amount of arguments must equal 2 for $rateColumns func. Parsed arguments are: %v", args)
+	if args == nil || len(args) != 3 {
+		return "", fmt.Errorf("amount of arguments must equal 3 for $rateColumns func. Parsed arguments are: %v", args)
 	}
 
-	query, err = q._columns(args[0].(string), args[1].(string), "", fromQuery)
+	query, err = q._rateColumns(args[0].(string), args[1].(string), args[2].(string), "", fromQuery)
 	if err != nil {
 		return "", err
 	}
-	return beforeMacrosQuery + "SELECT t" +
-		", arrayMap(a -> (a.1, a.2/runningDifference( t/1000 )), groupArr)" +
+	return query, nil
+}
+
+func (q *EvalQuery) _rateColumns(key, value, time, beforeMacrosQuery, fromQuery string) (string, error) {
+	if key[len(key)-1] == ')' || value[len(value)-1] == ')' {
+		return "", fmt.Errorf("some of passed arguments are without aliases: %s, %s", key, value)
+	}
+	var keySplit = strings.Split(strings.Trim(key, " \xA0\t\r\n"), " ")
+	var keyAlias = keySplit[len(keySplit)-1]
+	var valueSplit = strings.Split(strings.Trim(value, " \xA0\t\r\n"), " ")
+	var valueAlias = valueSplit[len(valueSplit)-1]
+	var havingIndex = strings.Index(strings.ToLower(fromQuery), "having")
+	var having = ""
+
+	if havingIndex != -1 {
+		having = " " + fromQuery[havingIndex:]
+		fromQuery = fromQuery[0 : havingIndex-1]
+	}
+	fromQuery = q._applyTimeFilter(fromQuery)
+	var col = "(" + valueAlias + " - neighbor(" + valueAlias + ",-" + time + "," + valueAlias + "))/((t - neighbor(t,-" + time + ",1)) / 1000" + valueAlias
+	return beforeMacrosQuery + "SELECT" +
+		" t," +
+		" groupArray((" + key + ", " + valueAlias + ")) AS groupArr" +
+		"FROM (SELECT t," + keyAlias + ", " + col +
 		" FROM (" +
-		query +
-		")", nil
+		" SELECT $timeSeriesMs AS t" +
+		", " + key +
+		", " + value + " " +
+		fromQuery +
+		" GROUP BY t, " + keyAlias +
+		having +
+		" ORDER BY t ))" +
+		" GROUP BY t" +
+		" ORDER BY t", nil
+}
+
+func (q *EvalQuery) irateColumns(query string, ast *EvalAST) (string, error) {
+	macroQueries, err := q._parseMacro("$irateColumns", query)
+	if err != nil {
+		return "", err
+	}
+	fromQuery := macroQueries[1]
+	if len(fromQuery) < 1 {
+		return query, nil
+	}
+	var args = ast.Obj["$irateColumns"].(*EvalAST).Arr
+	if args == nil || len(args) != 3 {
+		return "", fmt.Errorf("amount of arguments must equal 3 for $irateColumns func. Parsed arguments are: %v", args)
+	}
+
+	query, err = q._irateColumns(args[0].(string), args[1].(string), "", fromQuery)
+	if err != nil {
+		return "", err
+	}
+	return query, nil
 }
 
 func (q *EvalQuery) _fromIndex(query, macro string) (int, error) {
@@ -386,8 +479,8 @@ func (q *EvalQuery) _fromIndex(query, macro string) (int, error) {
 	return matches[1] - len(fragmentWithFrom) + fromRelativeIndex, nil
 }
 
-func (q *EvalQuery) rate(query string, ast *EvalAST) (string, error) {
-	macroQueries, err := q._parseMacro("$rate", query)
+func (q *EvalQuery) irate(query string, ast *EvalAST) (string, error) {
+	macroQueries, err := q._parseMacro("$irate", query)
 	if err != nil {
 		return "", err
 	}
@@ -395,15 +488,16 @@ func (q *EvalQuery) rate(query string, ast *EvalAST) (string, error) {
 	if len(fromQuery) < 1 {
 		return query, nil
 	}
-	var args = ast.Obj["$rate"].(*EvalAST).Arr
-	if args == nil || len(args) < 1 {
-		return "", fmt.Errorf("Amount of arguments must be > 0 for $rate func. Parsed arguments are: %v ", args)
+	var args = ast.Obj["$irate"].(*EvalAST).Arr
+	if args == nil || len(args) < 2 {
+		return "", fmt.Errorf("Amount of arguments must be > 1 for $irate func. Parsed arguments are: %v ", args)
 	}
 
-	return q._rate(args, beforeMacrosQuery, fromQuery)
+	return q._irate(args, beforeMacrosQuery, fromQuery)
 }
 
-func (q *EvalQuery) _rate(args []interface{}, beforeMacrosQuery, fromQuery string) (string, error) {
+func (q *EvalQuery) _irate(args []interface{}, beforeMacrosQuery, fromQuery string) (string, error) {
+	args = args[:len(args)-1]
 	var aliases = make([]string, len(args))
 	var argsStr = make([]string, len(args))
 	for i, arg := range args {
@@ -418,7 +512,7 @@ func (q *EvalQuery) _rate(args []interface{}, beforeMacrosQuery, fromQuery strin
 
 	var cols []string
 	for _, a := range aliases {
-		cols = append(cols, a+"/runningDifference(t/1000) "+a+"Rate")
+		cols = append(cols, "(("+a+" - neighbor("+a+",-1,"+a+"))/((t - neighbor(t,-1,1))/1000))"+a+"_iRate")
 	}
 
 	fromQuery = q._applyTimeFilter(fromQuery)
@@ -426,10 +520,57 @@ func (q *EvalQuery) _rate(args []interface{}, beforeMacrosQuery, fromQuery strin
 		"t," +
 		" " + strings.Join(cols, ", ") +
 		" FROM (" +
-		" SELECT $timeSeries AS t" +
+		" SELECT $timeSeriesMs AS t" +
 		", " + strings.Join(argsStr, ", ") +
 		" " + fromQuery +
 		" GROUP BY t" +
+		" ORDER BY t" +
+		")", nil
+}
+
+func (q *EvalQuery) rate(query string, ast *EvalAST) (string, error) {
+	macroQueries, err := q._parseMacro("$rate", query)
+	if err != nil {
+		return "", err
+	}
+	beforeMacrosQuery, fromQuery := macroQueries[0], macroQueries[1]
+	if len(fromQuery) < 1 {
+		return query, nil
+	}
+	var args = ast.Obj["$rate"].(*EvalAST).Arr
+	if args == nil || len(args) < 2 {
+		return "", fmt.Errorf("Amount of arguments must be > 1 for $rate func. Parsed arguments are: %v ", args)
+	}
+
+	return q._rate(args[:len(args)-1], args[len(args)-1].(string), beforeMacrosQuery, fromQuery)
+}
+
+func (q *EvalQuery) _rate(args []interface{}, time, beforeMacrosQuery, fromQuery string) (string, error) {
+	var aliases = make([]string, len(args))
+	var argsStr = make([]string, len(args))
+	for i, arg := range args {
+		str := arg.(string)
+		if str[len(str)-1] == ')' {
+			return "", fmt.Errorf("argument %v cant be used without alias", str)
+		}
+		argSplit := strings.Split(strings.Trim(str, " \xA0\t\r\n"), " ")
+		aliases[i] = argSplit[len(argSplit)-1]
+		argsStr[i] = arg.(string)
+	}
+
+	var cols []string
+	for _, a := range aliases {
+		cols = append(cols, "(("+a+" - neighbor("+a+",-"+time+","+a+"))/((t - neighbor(t,-"+time+",1))/1000))"+a+"_Rate")
+	}
+
+	fromQuery = q._applyTimeFilter(fromQuery)
+	return beforeMacrosQuery + "SELECT " +
+		"t," +
+		" " + strings.Join(cols, ", ") +
+		" FROM (" +
+		" SELECT $timeSeriesMs AS t" +
+		", " + strings.Join(argsStr, ", ") +
+		" " + fromQuery +
 		" ORDER BY t" +
 		")", nil
 }
@@ -550,12 +691,14 @@ func (q *EvalQuery) increaseColumns(query string, ast *EvalAST) (string, error) 
 		return query, nil
 	}
 	var args = ast.Obj["$increaseColumns"].(*EvalAST).Arr
-	if len(args) != 2 {
-		return "", fmt.Errorf("amount of arguments must equal 2 for $increaseColumns func. Parsed arguments are: %v", args)
+	if len(args) != 3 {
+		return "", fmt.Errorf("amount of arguments must equal 3 for $increaseColumns func. Parsed arguments are: %v", args)
 	}
+	var timeStr = args[len(args)-1].(string)
+	args = args[:len(args)-1]
 
 	var key = args[0].(string)
-	var value = "max(" + strings.Trim(args[1].(string), " \xA0\t\r\n") + ") AS max_0"
+	var value = strings.Trim(args[1].(string), " \xA0\t\r\n") + " AS val_0"
 	var havingIndex = strings.Index(strings.ToLower(fromQuery), "having")
 	var having = ""
 	var aliasIndex = strings.Index(strings.ToLower(key), " as ")
@@ -574,13 +717,12 @@ func (q *EvalQuery) increaseColumns(query string, ast *EvalAST) (string, error) 
 
 	return beforeMacrosQuery + "SELECT" +
 		" t," +
-		" groupArray((" + alias + ", max_0_Increase)) AS groupArr" +
+		" groupArray((" + alias + ", val))" +
 		" FROM (" +
-		" SELECT t," +
-		" " + alias +
-		", if(runningDifference(max_0) < 0 OR neighbor(" + alias + ",-1," + alias + ") != " + alias + ", 0, runningDifference(max_0)) AS max_0_Increase" +
+		" SELECT t," + " " + alias +
+		", (val_0 - neighbor(val_0,-" + timeStr + ",val_0) AS val" +
 		" FROM (" +
-		" SELECT $timeSeries AS t" +
+		" SELECT $timeSeriesMs AS t" +
 		", " + key +
 		", " + value + " " +
 		fromQuery +
@@ -685,22 +827,30 @@ func (q *EvalQuery) increase(query string, ast *EvalAST) (string, error) {
 		return query, nil
 	}
 	var args = ast.Obj["$increase"].(*EvalAST).Arr
-	if len(args) < 1 {
-		return "", fmt.Errorf("amount of arguments must be > 0 for $increase func. Parsed arguments are: %v", args)
-	}
-	for i, a := range args {
-		args[i] = fmt.Sprintf("max("+strings.Trim(a.(string), " \xA0\t\r\n")+") AS max_%d", i)
+	if len(args) < 2 {
+		return "", fmt.Errorf("amount of arguments must be > 1 for $increase func. Parsed arguments are: %v", args)
 	}
 
-	return q._increase(args, beforeMacrosQuery, fromQuery)
+	return q._increase(args[:len(args)-1], args[len(args)-1].(string), beforeMacrosQuery, fromQuery)
 }
 
-func (q *EvalQuery) _increase(args []interface{}, beforeMacrosQuery, fromQuery string) (string, error) {
-	var cols = make([]string, len(args))
+func (q *EvalQuery) _increase(args []interface{}, time, beforeMacrosQuery, fromQuery string) (string, error) {
 	var argsStr = make([]string, len(args))
-	for i, item := range args {
-		argsStr[i] = item.(string)
-		cols[i] = fmt.Sprintf("if(runningDifference(max_%d) < 0, 0, runningDifference(max_%d)) AS max_%d_Increase", i, i, i)
+	var aliases = make([]string, len(args))
+
+	for i, arg := range args {
+		str := arg.(string)
+		if str[len(str)-1] == ')' {
+			return "", fmt.Errorf("argument %v cant be used without alias", str)
+		}
+		argSplit := strings.Split(strings.Trim(str, " \xA0\t\r\n"), " ")
+		aliases[i] = argSplit[len(argSplit)-1]
+		argsStr[i] = arg.(string)
+	}
+
+	var cols []string
+	for _, a := range aliases {
+		cols = append(cols, a+" - neighbor("+a+",-"+time+","+a+") "+a+"_Increase")
 	}
 
 	fromQuery = q._applyTimeFilter(fromQuery)
@@ -708,7 +858,7 @@ func (q *EvalQuery) _increase(args []interface{}, beforeMacrosQuery, fromQuery s
 		"t," +
 		" " + strings.Join(cols, ", ") +
 		" FROM (" +
-		" SELECT $timeSeries AS t," +
+		" SELECT $timeSeriesMs AS t," +
 		" " + strings.Join(argsStr, ", ") +
 		" " + fromQuery +
 		" GROUP BY t" +
@@ -758,6 +908,9 @@ func (q *EvalQuery) getNaturalTimeSeries(dateTimeType string, from, to int64) st
 			return "toUInt32(toDateTime(toStartOfQuarter($dateTimeCol))) * 1000"
 		}
 	}
+	if dateTimeType == "TIMESTAMP64" {
+		return "intDiv($dateTimeCol, $interval) * $interval"
+	}
 	return "(intDiv($dateTimeCol, $interval) * $interval) * 1000"
 }
 
@@ -767,6 +920,9 @@ func (q *EvalQuery) getTimeSeries(dateTimeType string) string {
 	}
 	if dateTimeType == "DATETIME64" {
 		return "(intDiv(toFloat64($dateTimeCol) * 1000, ($interval * 1000)) * ($interval * 1000))"
+	}
+	if dateTimeType == "TIMESTAMP64" {
+		return "intDiv($dateTimeCol, $interval) * $interval"
 	}
 	return "(intDiv($dateTimeCol, $interval) * $interval) * 1000"
 }
@@ -793,6 +949,9 @@ func (q *EvalQuery) getDateTimeFilter(dateTimeType string) string {
 		if dateTimeType == "DATETIME64" {
 			return "toDateTime64(" + t + ", 3)"
 		}
+		if dateTimeType == "TIMESTAMP64" {
+			return t + "*1000"
+		}
 		return t
 	}
 	return "$dateTimeCol >= " + convertFn("$from") + " AND $dateTimeCol <= " + convertFn("$to")
@@ -805,6 +964,9 @@ func (q *EvalQuery) getDateTimeFilterMs(dateTimeType string) string {
 		}
 		if dateTimeType == "DATETIME64" {
 			return "toDateTime64(" + t + ", 3)"
+		}
+		if dateTimeType == "TIMESTAMP64" {
+			return t + "*1000"
 		}
 		return t
 	}
@@ -1411,7 +1573,7 @@ const joinsRe = "\\b(" +
 	")\\b"
 const onJoinTokenRe = "\\b(using|on)\\b"
 const tableNameRe = `([A-Za-z0-9_]+|[A-Za-z0-9_]+\\.[A-Za-z0-9_]+)`
-const macroFuncRe = "(\\$rateColumns|\\$perSecondColumns|\\$deltaColumns|\\$increaseColumns|\\$rate|\\$perSecond|\\$delta|\\$increase|\\$columns)"
+const macroFuncRe = "(\\$rateColumns|\\$irateColumns|\\$perSecondColumns|\\$deltaColumns|\\$increaseColumns|\\$rate|\\$irate|\\$perSecond|\\$delta|\\$increase|\\$columns)"
 const condRe = "\\b(or|and)\\b"
 const inRe = "\\b(global in|global not in|not in|in)\\b"
 const closureRe = "[\\(\\)\\[\\]]"
@@ -1652,6 +1814,11 @@ func printAST(AST *EvalAST, tab string) string {
 		result += printItems(AST.Obj["$rate"].(*EvalAST), tab, ",") + ")"
 	}
 
+	if AST.hasOwnProperty("$irate") {
+		result += tab + "$irate("
+		result += printItems(AST.Obj["$irate"].(*EvalAST), tab, ",") + ")"
+	}
+
 	if AST.hasOwnProperty("$perSecond") {
 		result += tab + "$perSecond("
 		result += printItems(AST.Obj["$perSecond"].(*EvalAST), tab, ",") + ")"
@@ -1670,6 +1837,11 @@ func printAST(AST *EvalAST, tab string) string {
 	if AST.hasOwnProperty("$rateColumns") {
 		result += tab + "$rateColumns("
 		result += printItems(AST.Obj["$rateColumns"].(*EvalAST), tab, ",") + ")"
+	}
+
+	if AST.hasOwnProperty("$irateColumns") {
+		result += tab + "$irateColumns("
+		result += printItems(AST.Obj["$irateColumns"].(*EvalAST), tab, ",") + ")"
 	}
 
 	if AST.hasOwnProperty("with") {

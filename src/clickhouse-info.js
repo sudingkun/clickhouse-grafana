@@ -356,6 +356,7 @@ export default function () {
             "$timeSeriesMs",
             "$naturalTimeSeries",
             "$rate",
+            "$irate",
             "$perSecond",
             "$perSecondColumns",
             "$delta",
@@ -364,6 +365,7 @@ export default function () {
             "$increaseColumns",
             "$columns",
             "$rateColumns",
+            "$irateColumns",
             "$unescape",
             "$adhoc",
             "$conditionalTest"
@@ -2302,7 +2304,7 @@ export default function () {
                 {
                     "name": "$timeFilter",
                     "def": "$timeFilter",
-                    "docText": "Replaced with currently selected `Time Range`. Requires `Column:Date` and `Column:DateTime` or `Column:TimeStamp` or `Column:DateTime64` to be selected"
+                    "docText": "Replaced with currently selected `Time Range`. Requires `Column:Date` and `Column:DateTime` or `Column:TimeStamp` or `Column:DateTime64` or `Column:TimeStamp64` to be selected"
                 },
                 {
                     "name": "$timeFilterMs",
@@ -2322,7 +2324,7 @@ export default function () {
                 {
                     "name": "$timeSeries",
                     "def": "$timeSeries",
-                    "docText": "Replaced with special ClickHouse construction to convert results as time-series data. Use it as `SELECT $timeSeries...`. Require `Column:DateTime` or `Column:TimeStamp` or `Column:DateTime64` to be selected"
+                    "docText": "Replaced with special ClickHouse construction to convert results as time-series data. Use it as `SELECT $timeSeries...`. Require `Column:DateTime` or `Column:TimeStamp` or `Column:DateTime64` or `Column:TimeStamp64 to be selected"
                 },
                 {
                     "name": "$timeSeriesMs",
@@ -2332,7 +2334,7 @@ export default function () {
                 {
                     "name": "$naturalTimeSeries",
                     "def": "$naturalTimeSeries",
-                    "docText": "Replaced with special ClickHouse construction to convert results as time-series data in logical/natural units. Use it as `SELECT $timeSeries...`. Require `Column:DateTime` or `Column:TimeStamp` to be selected"
+                    "docText": "Replaced with special ClickHouse construction to convert results as time-series data in logical/natural units. Use it as `SELECT $timeSeries...`. Require `Column:DateTime` or `Column:TimeStamp` or `Column:TimeStamp64` to be selected"
                 },
                 {
                     "name": "$rate",
@@ -2341,6 +2343,13 @@ export default function () {
                         "\n" +
                         "Example:\n $rate(countIf(Type = 200) AS good, countIf(Type != 200) AS bad) FROM requests"
                 },
+              {
+                "name": "$irate",
+                "def": "$irate(cols...)",
+                "docText": "Converts query results as `change rate per interval`. Can be used to display changes-per-second." +
+                  "\n" +
+                  "Example:\n $irate(countIf(Type = 200) AS good, countIf(Type != 200) AS bad) FROM requests"
+              },
                 {
                     "name": "$perSecond",
                     "def": "$perSecond(cols...)",
@@ -2398,6 +2407,13 @@ export default function () {
                         "\n" +
                         "Example:\n $rateColumns(OS, count(*) c) FROM requests"
                 },
+              {
+                "name": "$irateColumns",
+                "def": "$irateColumns(key, value)",
+                "docText": "A combination of `$columns` and `$irate` ." +
+                  "\n" +
+                  "Example:\n $irateColumns(OS, count(*) c) FROM requests"
+              },
                 {
                     "name": "$unescape",
                     "def": "$unescape($variable)",

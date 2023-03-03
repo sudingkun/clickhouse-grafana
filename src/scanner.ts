@@ -397,7 +397,7 @@ const wsRe = "\\s+",
         ")\\b",
     onJoinTokenRe = '\\b(using|on)\\b',
     tableNameRe = '([A-Za-z0-9_]+|[A-Za-z0-9_]+\\.[A-Za-z0-9_]+)',
-    macroFuncRe = "(\\$rateColumns|\\$perSecondColumns|\\$deltaColumns|\\$increaseColumns|\\$rate|\\$perSecond|\\$delta|\\$increase|\\$columns)",
+    macroFuncRe = "(\\$rateColumns|\\$irateColumns|\\$perSecondColumns|\\$deltaColumns|\\$increaseColumns|\\$rate|\\$irate|\\$perSecond|\\$delta|\\$increase|\\$columns)",
     condRe = "\\b(or|and)\\b",
     inRe = "\\b(global in|global not in|not in|in)\\b",
     closureRe = "[\\(\\)\\[\\]]",
@@ -615,6 +615,11 @@ function print(AST, tab = '') {
         result += printItems(AST.$rate, tab, ',') + ')';
     }
 
+    if (isSet(AST, '$irate')) {
+        result += tab + '$irate(';
+        result += printItems(AST.$irate, tab, ',') + ')';
+    }
+
     if (isSet(AST, '$perSecond')) {
         result += tab + '$perSecond(';
         result += printItems(AST.$perSecond, tab, ',') + ')';
@@ -653,6 +658,10 @@ function print(AST, tab = '') {
     if (isSet(AST, '$rateColumns')) {
         result += tab + '$rateColumns(';
         result += printItems(AST.$rateColumns, tab, ',') + ')';
+    }
+    if (isSet(AST, '$irateColumns')) {
+        result += tab + '$irateColumns(';
+        result += printItems(AST.$irateColumns, tab, ',') + ')';
     }
 
     if (isSet(AST, 'with')) {
