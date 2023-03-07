@@ -134,9 +134,9 @@ class SqlQueryCtrl extends QueryCtrl {
         this.initEditor();
 
         this.target.promQLNameColumn = this.target.promQLNameColumn || 'name';
-        this.target.promQLValue = this.target.promQLValue || 'anyLast(value) val';
+        this.target.promQLValue = this.target.promQLValue || 'value';
         if (this.target.promQLModel && this.target.promQL) {
-            this.target.query = SqlQuery.promQL2Query(this.target.promQLValue, this.target.promQL);
+            this.target.query = SqlQuery.promQL2Query(this.target);
         }
 
     }
@@ -235,7 +235,7 @@ class SqlQueryCtrl extends QueryCtrl {
     refreshPromQL() {
         // 断是否有 promQL,如果有转换成 query
         if (this.target.promQLModel && this.target.promQL) {
-            this.target.query = SqlQuery.promQL2Query(this.target.promQLValue || 'value', this.target.promQL);
+            this.target.query = SqlQuery.promQL2Query(this.target);
         }
         this.refresh();
     }
@@ -346,6 +346,12 @@ class SqlQueryCtrl extends QueryCtrl {
             self.applySegment(self.dateTimeColDataTypeSegment, segments[0]);
             self.dateTimeColDataTypeChanged();
         });
+
+
+        this.querySegment('GROUP_BY').then(function (response) {
+            self.target.groupBy = response.map(g => g.text);
+        });
+
     }
 
     formatQuery() {
@@ -462,6 +468,13 @@ class SqlQueryCtrl extends QueryCtrl {
                     'FROM system.columns ' +
                     'WHERE database = \'' + this.target.database + '\' AND ' +
                     'table = \'' + this.target.table + '\'';
+                break;
+            case 'GROUP_BY':
+                query = 'SELECT name ' +
+                    'FROM system.columns ' +
+                    'WHERE database = \'' + this.target.database + '\' AND ' +
+                    'table = \'' + this.target.table + '\'' +
+                    " and name not in ('host', 'value', 'collect_date', 'mark_time', 'collect_time')";
                 break;
         }
         return query;

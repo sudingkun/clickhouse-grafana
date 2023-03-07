@@ -1,6 +1,6 @@
 <query-editor-row query-ctrl="ctrl" can-collapse="true" has-text-edit-mode="true">
 
-	<div class="gf-form" ng-if="ctrl.target.rawQuery">
+	<div class="gf-form" ng-if="ctrl.target.rawQuery && !ctrl.target.promQLModel">
         <code-editor content="ctrl.target.query"
                      datasource="ctrl.datasource"
                      on-change="ctrl.panelCtrl.refresh(); ctrl.refresh()"
@@ -10,7 +10,66 @@
         </code-editor>
 	</div>
 
-	<div ng-if="!ctrl.target.rawQuery">
+<!--    <div class="gf-form-inline" ng-if="ctrl.target.promQLModel">-->
+<!--        <div class="gf-form">-->
+<!--            <label class="gf-form-label width-5">Name</label>-->
+<!--            <input type="text" class="gf-form-input max-width-7" ng-model="ctrl.target.promQLNameColumn"-->
+<!--                   data-placement="right"-->
+<!--                   spellcheck='false'-->
+<!--                   ng-model-onblur-->
+<!--                   ng-change="ctrl.refreshPromQL()"/>-->
+<!--            <info-popover mode="right-absolute">-->
+<!--                promQL name 字段名称。Prometheus上报数据可不修改-->
+<!--            </info-popover>-->
+<!--        </div>-->
+<!--        <div class="gf-form">-->
+<!--            <label class="gf-form-label width-5">Value</label>-->
+<!--            <input type="text" class="gf-form-input max-width-9" ng-model="ctrl.target.promQLValue"-->
+<!--                   data-placement="right"-->
+<!--                   spellcheck='false'-->
+<!--                   ng-model-onblur-->
+<!--                   ng-change="ctrl.refreshPromQL()"/>-->
+<!--            <info-popover mode="right-absolute">-->
+<!--                由于数据是按时间汇聚，所以值需要使用聚合函数。Prometheus上报数据可不修改-->
+<!--            </info-popover>-->
+<!--        </div>-->
+
+<!--        <div class="gf-form gf-form&#45;&#45;grow">-->
+<!--            <div class="gf-form-label gf-form-label&#45;&#45;grow"></div>-->
+<!--        </div>-->
+<!--    </div>-->
+    <div class="gf-form" ng-if="ctrl.target.promQLModel">
+        <label class="gf-form-label width-5">Metrics</label>
+
+        <input type="text" class="gf-form-input" ng-model="ctrl.target.promQL"
+               data-placement="right"
+               spellcheck='false'
+               placeholder="输入PromQL表达式"
+               ng-change="ctrl.refreshPromQL()"
+               ng-model-onblur
+        />
+
+    </div>
+
+    <div class="gf-form" ng-if="ctrl.target.promQLModel">
+        <label class="gf-form-label width-5">
+            Legend
+            <info-popover>
+                Controls the name of the time series, using name or pattern. For example $hostname will be replaced
+                with label value for the label hostname.
+            </info-popover>
+        </label>
+        <input type="text" class="gf-form-input max-width-12" ng-model="ctrl.target.promQLLegend"
+               data-placement="right"
+               spellcheck='false'
+               ng-model-onblur
+               ng-change="ctrl.refreshPromQL()"
+        />
+
+    </div>
+
+
+	<div ng-if="!ctrl.target.rawQuery && !ctrl.target.promQLModel">
 		<div class="gf-form-inline">
 			<div class="gf-form">
 				<label class="gf-form-label query-keyword width-7">
@@ -40,8 +99,11 @@
                 </metric-segment-model>
                 <info-popover mode="right-absolute" style = "margin-right: 10px;">
                     Select Event
-                    <a href="https://clickhouse.tech/docs/en/sql-reference/data-types/datetime/" target = "_blank" >DateTime</a>, <a href="https://clickhouse.tech/docs/en/sql-reference/data-types/datetime64/" target = "_blank" >DateTime64</a>
-                    or <a href="https://clickhouse.tech/docs/en/sql-reference/data-types/int-uint/" target="_blank">UInt32</a> column for binding with Grafana's range selector
+                    <a href="https://clickhouse.tech/docs/en/sql-reference/data-types/datetime/" target="_blank">DateTime</a>,
+                    <a href="https://clickhouse.tech/docs/en/sql-reference/data-types/datetime64/" target="_blank">DateTime64</a>
+                    or <a href="https://clickhouse.tech/docs/en/sql-reference/data-types/int-uint/" target="_blank">UInt32</a>
+                    or <a href="https://clickhouse.tech/docs/en/sql-reference/data-types/int-uint/" target="_blank">Int64</a>
+                    column for binding with Grafana's range selector
                 </info-popover>
             </div>
 
@@ -56,7 +118,8 @@
                 <label class="gf-form-label query-keyword width-10">
                     <info-popover mode="right-absolute">
                         Select
-                        <a href="https://clickhouse.tech/docs/en/sql-reference/data-types/date/" target = "_blank" >Date</a>
+                        <a href="https://clickhouse.tech/docs/en/sql-reference/data-types/date/"
+                           target="_blank">Date</a>
                         column for binding with Grafana's range selector
                     </info-popover>
                     Column:Date
@@ -65,7 +128,9 @@
             </div>
 
             <style>
-                .typeahead.dropdown-menu a {min-height: 2em;}
+                .typeahead.dropdown-menu a {
+                    min-height: 2em;
+                }
             </style>
             <div class="gf-form">
                 <metric-segment segment="ctrl.dateColDataTypeSegment"
@@ -83,11 +148,30 @@
                 <i class="fa fa-arrow-right"></i>&nbsp;
                 Go to Query
             </button>
+            <button class="btn btn-inverse gf-form-btn query-keyword" ng-click="ctrl.toPromQLMode();">
+                <i class="fa fa-arrow-right"></i>&nbsp;
+                Go to PromQL
+            </button>
         </div>
 
 	</div>
 
-    <div class="gf-form-inline" ng-if="ctrl.target.rawQuery">
+    <div class="gf-form-inline" ng-if="ctrl.target.rawQuery && !ctrl.target.promQLModel">
+        <div class="gf-form" ng-if="!ctrl.target.promQLModel">
+            <label class="gf-form-label width-5"> Legend</label>
+            <input type="text" class="gf-form-input max-width-12" ng-model="ctrl.target.promQLLegend"
+                   data-placement="right"
+                   spellcheck='false'
+                   ng-model-onblur
+                   ng-change="ctrl.refreshPromQL()"
+                   />
+            <info-popover mode="right-absolute">
+                Controls the name of the time series, using name or pattern. For example {{hostname}} will be replaced
+                with label value for the label hostname.
+            </info-popover>
+        </div>
+
+
         <div class="gf-form">
             <label class="gf-form-label width-5">Step</label>
             <input type="text" class="gf-form-input max-width-5" ng-model="ctrl.target.interval"
@@ -133,7 +217,7 @@
         </div>
     </div>
 
-    <div class="gf-form-inline" ng-if="ctrl.target.rawQuery">
+    <div class="gf-form-inline" ng-if="ctrl.target.rawQuery && !ctrl.target.promQLModel">
         <div class="gf-form">
             <label class="gf-form-label query-keyword">Format as</label>
             <div class="gf-form-select-wrapper">

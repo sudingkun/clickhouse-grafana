@@ -1,6 +1,6 @@
 ///<reference path="../node_modules/grafana-sdk-mocks/app/headers/common.d.ts" />
 
-import {each, isArray, isEmpty, isString, map, trimEnd} from 'lodash-es';
+import {each, isArray, isEmpty, isString, map, trim, trimEnd, trimStart} from 'lodash-es';
 import * as dateMath from 'grafana/app/core/utils/datemath';
 import moment from 'moment';
 import Scanner from './scanner';
@@ -34,7 +34,8 @@ export default class SqlQuery {
     replace(options, adhocFilters) {
         // 断是否有 promQL,如果有转换成 query
         if (this.target.promQLModel && this.target.promQL) {
-            this.target.query = SqlQuery.promQL2Query(this.target.promQLValue || 'value', this.target.promQL);
+            // this.target.query = SqlQuery.promQL2Query(this.target.promQLValue || 'value', this.target.promQL, this.target.promQLLegend);
+            this.target.query = SqlQuery.promQL2Query(this.target);
         }
         let query = this.templateSrv.replace(
             SqlQuery.conditionalTest(this.target.query.trim(), this.templateSrv), options.scopedVars, SqlQuery.interpolateQueryExpr
@@ -103,11 +104,11 @@ export default class SqlQuery {
             }
 
             topQueryAST.promQLLegend = this.target.promQLLegend;
+            topQueryAST.promQLColumns = this.target.groupBy;
             query = SqlQuery.applyMacros(query, topQueryAST);
         } catch (err) {
             console.error('AST parser error: ', err);
         }
-        console.log(query);
 
         /* Render the ad-hoc condition or evaluate to an always true condition */
         let renderedAdHocCondition = '1';
@@ -154,25 +155,33 @@ export default class SqlQuery {
             : SqlQuery.convertInterval(this.target.round, 1);
         this.target.rawQuery = SqlQuery.replaceTimeFilters(this.target.rawQuery, this.options.range, dateTimeType, round);
 
+        console.log(this.target.rawQuery);
         return this.target.rawQuery;
     }
 
-    static promQL2Query(promQLValue: string, promQL: string): string {
-        const regex = /\b(\w+)\b(?!=\s*=)/g;
-        const custom_function = ['rate','irate','increase','ceil'];
-        const matches = promQL.match(regex);
+    static promQL2Query(target): string {
+        const promQL = target.promQL;
+        const promQLLegend = target.promQLLegend;
+        const promQLValue = target.promQLValue || 'value';
+        const columns = target.groupBy;
+        let columns_tags = [];
+        columns.forEach(result => {
+            columns_tags.push(`if(${result} = '', '', concat('${result}="', ${result}, '"'))`);
+        });
+        let tags = columns_tags.join(', ');
+
+
+        const regex = /(\w+)|(\$?\w+)|"([^"]*)"/g;
+        const custom_function = ['rate', 'irate', 'increase', 'ceil'];
+        const matches = promQL.match(regex).filter(match => match).map(match => trim(match, '"'));
 
         let queryStr;
-        let template;
 
-        // todo validate matches
         let func = '';
         let name = '';
         let conditions = '';
         let time = '';
         if (custom_function.indexOf(matches[0]) > -1) {
-            template = '${func}({promQLValue},{time}) FROM $table WHERE name = \'{name}\' and {conditions}';
-
             func = matches[0];
             name = matches[1];
             time = trimEnd((matches[matches.length - 1].replace('m', '')));
@@ -181,37 +190,59 @@ export default class SqlQuery {
             for (let i = 0; i < where.length; i += 2) {
                 let key = where[i];
                 let value = where[i + 1];
-                console.log(key, value);
-                conditions += conditions + key + '=\'$' + value + '\' and ';
+                conditions += ` ${key} = '${value}' and `;
             }
 
-        } else {
-            template = 'SELECT $timeSeriesMs as t, {promQLValue} \n' +
-                'FROM $table \n' +
-                'WHERE $timeFilter \n' +
-                'and name = \'{name}\' \n' +
-                'and {conditions} \n' +
-                'GROUP BY t ORDER BY t';
+            queryStr = `$${func}(${promQLValue},${time}) FROM $table WHERE ${conditions} name = '${name}'`;
 
+        } else {
             name = matches[0];
             const where = matches.slice(1, matches.length);
             for (let i = 0; i < where.length; i += 2) {
                 let key = where[i];
                 let value = where[i + 1];
-                conditions += conditions + key + '=\'$' + value + '\' and ';
+                conditions += ` ${key} = '${value}' and`;
             }
+
+            if (!promQLLegend) {
+                queryStr = `SELECT t, array((tags, val))
+                            FROM (SELECT $timeSeriesMs as                                t,
+                                         array(${tags})                                  allTags,
+                                         arrayFilter(allTags -> allTags != '', allTags) tags,
+                                         anyLast(value)                                  val
+                                  FROM $table
+                                  WHERE $timeFilter
+                                    and ${conditions} name = '${name}'
+                                  GROUP BY t, ${columns})
+                            ORDER BY t`;
+
+            } else {
+                const regex = /{{(.*?)}}/g;
+                let nameTags = [];
+                let match = null;
+                let keyName = promQLLegend;
+                while (match = regex.exec(promQLLegend)) {
+                    let column = match[1];
+                    nameTags.push(`'${column}', ${column} `);
+                    keyName = keyName.replaceAll(`{{${column}}}`,`',tags['${column}'],'`);
+                }
+
+                keyName =  `'${keyName}'`;
+                let tags = nameTags.join(', ');
+
+                queryStr = `SELECT t, array((concat(${keyName}), val))
+                            FROM (SELECT $timeSeriesMs as                                t,
+                                         map(${tags}) tags,
+                                         anyLast(value)                                  val
+                                  FROM $table
+                                  WHERE $timeFilter
+                                    and ${conditions} name = '${name}'
+                                  GROUP BY t, ${columns})
+                            ORDER BY t`;
+
+            }
+
         }
-
-        conditions = trimEnd(conditions.trim(), 'and');
-
-        queryStr = template
-            .replace('{func}', func)
-            .replace("{promQLValue}", promQLValue)
-            .replace('{name}', name)
-            .replace('{conditions}', conditions)
-            .replace('{time}', time);
-
-        console.log(queryStr);
 
         return queryStr;
     }
@@ -265,9 +296,11 @@ export default class SqlQuery {
 
     static getFilterSqlForDateTime(columnName: string, dateTimeType: string) {
         const convertFn = this.getConvertFn(dateTimeType);
-        let from = '$from'; let to = '$to';
+        let from = '$from';
+        let to = '$to';
         if (dateTimeType === 'DATETIME64') {
-            from = '$__from/1000'; to = '$__to/1000';
+            from = '$__from/1000';
+            to = '$__to/1000';
         }
         return `${columnName} >= ${convertFn(from)} AND ${columnName} <= ${convertFn(to)}`;
     }
@@ -439,37 +472,73 @@ export default class SqlQuery {
             return query;
         }
         let args = ast['$irate'];
-        if (args.length < 2) {
-            throw {message: 'Amount of arguments must be > 1 for $irate func. Parsed arguments are:  ' + args.join(', ')};
+        let promQLLegend = ast['promQLLegend'];
+        let columns = ast['promQLColumns'];
+        if (args.length !== 2) {
+            throw {message: 'Amount of arguments must equal 2 for $irate func. Parsed arguments are:  ' + args.join(', ')};
         }
 
-        return SqlQuery._irate(args, args.pop(), beforeMacrosQuery, fromQuery);
+
+        return SqlQuery._irate(args, args.pop(), promQLLegend, columns, beforeMacrosQuery, fromQuery);
     }
 
-    static _irate(args, time: number, beforeMacrosQuery, fromQuery: string): string {
-        let aliases = [];
-        each(args, function (arg) {
-            if (arg.slice(-1) === ')') {
-                throw {message: 'Argument "' + arg + '" cant be used without alias'};
-            }
-            aliases.push(arg.trim().split(' ').pop());
-        });
-
-        let cols = [];
-        each(aliases, function (a) {
-            cols.push('((' + a + ' - neighbor(' + a + ', -1 ,' + a + '))/((t - neighbor(t, -1 , 1)) / 1000)) ' + a + '_iRate');
-        });
-
+    static _irate(args, time: number, promQLLegend: string, columns, beforeMacrosQuery, fromQuery: string): string {
+        let col = args[0];
+        if (col.trim().split(' ').length > 1) {
+            throw {message: 'Argument "' + col + '" cant be used with alias'};
+        }
         fromQuery = SqlQuery._applyTimeFilter(fromQuery);
-        return beforeMacrosQuery + 'SELECT ' +
-            't,' +
-            ' ' + cols.join(', ') +
-            ' FROM (' +
-            ' SELECT $timeSeriesMs AS t' +
-            ', ' + args.join(', ') +
-            ' ' + fromQuery +
-            ' ORDER BY t' +
-            ')';
+
+
+        let sql;
+        if (promQLLegend) {
+            const regex = /{{(.*?)}}/g;
+            let nameTags = [];
+            let match = null;
+            let keyName = promQLLegend;
+            while (match = regex.exec(promQLLegend)) {
+                let column = match[1];
+                nameTags.push(`'${column}', ${column} `);
+                keyName = keyName.replaceAll(`{{${column}}}`,`',tags['${column}'],'`);
+            }
+            keyName =  `'${keyName}'`;
+            let tags = nameTags.join(', ');
+
+
+            sql = `
+            SELECT t,  array((concat(${keyName}), abs((value - neighbor(value, -1, value)) / (t - neighbor(t,-1,1))) / 1000 ))
+            FROM (
+                     SELECT t, tags, any(val) value FROM (
+                     SELECT $timeSeriesMs AS t,
+                         map(${tags}) tags,
+                     anyLast(${col})   val
+                     ${fromQuery} GROUP BY t, ${columns}) GROUP BY t,tags
+                                                          ORDER BY tags,t
+                 ) ORDER BY t
+            `;
+        } else {
+            let columns_tags = [];
+            columns.forEach(result => {
+                columns_tags.push(`if(${result} = '', '', concat('${result}="', ${result}, '"'))`);
+            });
+            let tags = columns_tags.join(', ');
+
+            sql = `
+            SELECT t,  array((tags, abs((value - neighbor(value, -1, value)) / (t - neighbor(t,-1,1))) / 1000 ))
+            FROM (
+                     SELECT t, tags, any(val) value FROM (
+                     SELECT $timeSeriesMs AS t,
+                     array(${tags})                                  allTags,
+                     arrayFilter(allTags -> allTags != '', allTags)  tags,
+                     anyLast(${col})   val
+                     ${fromQuery} GROUP BY t, ${columns}) GROUP BY t,tags
+                                                          ORDER BY tags,t
+                 ) ORDER BY t
+            `;
+        }
+
+
+        return beforeMacrosQuery + sql;
     }
 
     static rate(query: string, ast: any): string {
@@ -479,47 +548,70 @@ export default class SqlQuery {
         }
         let args = ast['$rate'];
         let promQLLegend = ast['promQLLegend'];
-        if (args.length < 2) {
-            throw {message: 'Amount of arguments must be > 1 for $rate func. Parsed arguments are:  ' + args.join(', ')};
+        let columns = ast['promQLColumns'];
+        if (args.length !== 2) {
+            throw {message: 'Amount of arguments must equal 2 for $rate func. Parsed arguments are:  ' + args.join(', ')};
         }
 
-        return SqlQuery._rate(args, args.pop(),promQLLegend, beforeMacrosQuery, fromQuery);
+        return SqlQuery._rate(args, args.pop(), promQLLegend, columns, beforeMacrosQuery, fromQuery);
     }
 
-    static _rate(args, time: number, promQLLegend: string, beforeMacrosQuery, fromQuery: string): string {
-        if (promQLLegend === null) {
-            promQLLegend = '';
-        } else {
-            promQLLegend += ', ';
+    static _rate(args, time: number, promQLLegend: string, columns, beforeMacrosQuery, fromQuery: string): string {
+        let col = args[0];
+        if (col.trim().split(' ').length > 1) {
+            throw {message: 'Argument "' + col + '" cant be used with alias'};
         }
-        let aliases = [];
-        each(args, function (arg) {
-            if (arg.slice(-1) === ')') {
-                throw {message: 'Argument "' + arg + '" cant be used without alias'};
-            }
-            aliases.push(arg.trim().split(' ').pop());
-        });
-
-        let cols = [];
-        each(aliases, function (a) {
-            // cols.push('((' + a + ' - neighbor(' + a + ',' + -time + ',' + a + '))/((t - neighbor(t, ' + -time + ', 1)) / 1000)) ' + a + '_Rate');
-            if (promQLLegend !== '') {
-                cols.push('array((' + promQLLegend + '((' + a + ' - neighbor(' + a + ',' + -time + ',' + a + '))/((t - neighbor(t, ' + -time + ', 1)) / 1000))))');
-            } else {
-                cols.push('((' + a + ' - neighbor(' + a + ',' + -time + ',' + a + '))/((t - neighbor(t, ' + -time + ', 1)) / 1000)) `value`');
-            }
-        });
-
         fromQuery = SqlQuery._applyTimeFilter(fromQuery);
-        return beforeMacrosQuery + 'SELECT ' +
-            't,' +
-            ' ' + cols.join(', ') +
-            ' FROM (' +
-            ' SELECT $timeSeries AS t' +
-            ', ' + promQLLegend + args.join(', ') +
-            ' ' + fromQuery +
-            ' ORDER BY t' +
-            ')';
+
+        let sql;
+        if (promQLLegend) {
+            const regex = /{{(.*?)}}/g;
+            let nameTags = [];
+            let match = null;
+            let keyName = promQLLegend;
+            while (match = regex.exec(promQLLegend)) {
+                let column = match[1];
+                nameTags.push(`'${column}', ${column} `);
+                keyName = keyName.replaceAll(`{{${column}}}`,`',tags['${column}'],'`);
+            }
+            keyName =  `'${keyName}'`;
+            let tags = nameTags.join(', ');
+
+
+            sql = `
+            SELECT t,  array((concat(${keyName}), abs((value - neighbor(value, -${time}, value)) / (t - neighbor(t,-${time},1))) / 1000 ))
+            FROM (
+                     SELECT t, tags, any(val) value FROM (
+                     SELECT $timeSeriesMs AS t,
+                         map(${tags}) tags,
+                     anyLast(${col})   val
+                     ${fromQuery} GROUP BY t, ${columns}) GROUP BY t,tags
+                                                          ORDER BY tags,t
+                 ) ORDER BY t
+            `;
+        } else {
+            let columns_tags = [];
+            columns.forEach(result => {
+                columns_tags.push(`if(${result} = '', '', concat('${result}="', ${result}, '"'))`);
+            });
+            let tags = columns_tags.join(', ');
+
+            sql = `
+            SELECT t,  array((tags, abs((value - neighbor(value, -${time}, value)) / (t - neighbor(t,-${time},1))) / 1000 ))
+            FROM (
+                     SELECT t, tags, any(val) value FROM (
+                     SELECT $timeSeriesMs AS t,
+                     array(${tags})                                  allTags,
+                     arrayFilter(allTags -> allTags != '', allTags)  tags,
+                     anyLast(${col})   val
+                     ${fromQuery} GROUP BY t, ${columns}) GROUP BY t,tags
+                                                          ORDER BY tags,t
+                 ) ORDER BY t
+            `;
+        }
+
+
+        return beforeMacrosQuery + sql;
     }
 
     static perSecondColumns(query: string, ast: any): string {
@@ -546,7 +638,7 @@ export default class SqlQuery {
             ' FROM (' +
             ' SELECT t,' +
             ' ' + alias +
-            ', if(runningDifference(max_0) < 0 OR neighbor('+ alias +',-1,'+ alias +') != '+ alias +', nan, runningDifference(max_0) / runningDifference(t/1000)) AS max_0_PerSecond' +
+            ', if(runningDifference(max_0) < 0 OR neighbor(' + alias + ',-1,' + alias + ') != ' + alias + ', nan, runningDifference(max_0) / runningDifference(t/1000)) AS max_0_PerSecond' +
             ' FROM (' +
             ' SELECT $timeSeries AS t' +
             ', ' + key +
@@ -586,7 +678,7 @@ export default class SqlQuery {
             ' FROM (' +
             ' SELECT t,' +
             ' ' + alias +
-            ', if(runningDifference(max_0) < 0 OR neighbor('+ alias +',-1,'+ alias +') != '+ alias +', 0, runningDifference(max_0)) AS max_0_Increase' +
+            ', if(runningDifference(max_0) < 0 OR neighbor(' + alias + ',-1,' + alias + ') != ' + alias + ', 0, runningDifference(max_0)) AS max_0_Increase' +
             ' FROM (' +
             ' SELECT $timeSeries AS t' +
             ', ' + key +
@@ -625,7 +717,7 @@ export default class SqlQuery {
             ' FROM (' +
             ' SELECT t,' +
             ' ' + alias +
-            ', if(neighbor('+ alias +',-1,'+ alias +') != '+ alias +', 0, runningDifference(max_0)) AS max_0_Delta' +
+            ', if(neighbor(' + alias + ',-1,' + alias + ') != ' + alias + ', 0, runningDifference(max_0)) AS max_0_Delta' +
             ' FROM (' +
             ' SELECT $timeSeries AS t' +
             ', ' + key +
@@ -700,35 +792,70 @@ export default class SqlQuery {
             return query;
         }
         let args = ast['$increase'];
-        if (args.length < 2) {
-            throw {message: 'Amount of arguments must be > 1 for $increase func. Parsed arguments are:  ' + args.join(', ')};
+        let promQLLegend = ast['promQLLegend'];
+        let columns = ast['promQLColumns'];
+        if (args.length !== 2) {
+            throw {message: 'Amount of arguments must equal 2 for $increase func. Parsed arguments are:  ' + args.join(', ')};
         }
-        return SqlQuery._increase(args, args.pop(), beforeMacrosQuery, fromQuery);
+        return SqlQuery._increase(args, args.pop(), promQLLegend, columns, beforeMacrosQuery, fromQuery);
     }
 
-    static _increase(args, time: number, beforeMacrosQuery, fromQuery: string): string {
-        let aliases = [];
-        each(args, function (arg) {
-            if (arg.slice(-1) === ')') {
-                throw {message: 'Argument "' + arg + '" cant be used without alias'};
-            }
-            aliases.push(arg.trim().split(' ').pop());
-        });
-        let cols = [];
-        each(aliases, function (a) {
-            cols.push(a + ' - neighbor(' + a + ',' + -time + ',' + a + ') ' + a + '_Increase');
-        });
-
+    static _increase(args, time: number, promQLLegend: string, columns, beforeMacrosQuery, fromQuery: string): string {
+        let col = args[0];
+        if (col.trim().split(' ').length > 1) {
+            throw {message: 'Argument "' + col + '" cant be used with alias'};
+        }
         fromQuery = SqlQuery._applyTimeFilter(fromQuery);
-        return beforeMacrosQuery + 'SELECT ' +
-            't,' +
-            ' ' + cols.join(', ') +
-            ' FROM (' +
-            ' SELECT $timeSeriesMs AS t,' +
-            ' ' + args.join(', ') +
-            ' ' + fromQuery +
-            ' ORDER BY t' +
-            ')';
+
+        let sql;
+        if (promQLLegend) {
+            const regex = /{{(.*?)}}/g;
+            let nameTags = [];
+            let match = null;
+            let keyName = promQLLegend;
+            while (match = regex.exec(promQLLegend)) {
+                let column = match[1];
+                nameTags.push(`'${column}', ${column} `);
+                keyName = keyName.replaceAll(`{{${column}}}`,`',tags['${column}'],'`);
+            }
+            keyName =  `'${keyName}'`;
+            let tags = nameTags.join(', ');
+
+
+            sql = `
+            SELECT t,  array((concat(${keyName}), abs(value - neighbor(value, -${time}, value))))
+            FROM (
+                     SELECT t, tags, any(val) value FROM (
+                     SELECT $timeSeriesMs AS t,
+                         map(${tags}) tags,
+                     anyLast(${col})   val
+                     ${fromQuery} GROUP BY t, ${columns}) GROUP BY t,tags
+                                                          ORDER BY tags,t
+                 ) ORDER BY t
+            `;
+
+
+        } else {
+            let columns_tags = [];
+            columns.forEach(result => {
+                columns_tags.push(`if(${result} = '', '', concat('${result}="', ${result}, '"'))`);
+            });
+            let tags = columns_tags.join(', ');
+
+            sql = `
+            SELECT t,  array((tags, abs(value - neighbor(value, -${time}, value))))
+            FROM (
+                     SELECT t, tags, any(val) value FROM (
+                     SELECT $timeSeriesMs AS t,
+                     array(${tags})                                  allTags,
+                     arrayFilter(allTags -> allTags != '', allTags)  tags,
+                     anyLast(${col})   val
+                     ${fromQuery} GROUP BY t, ${columns}) GROUP BY t,tags
+                                                          ORDER BY tags,t
+                 ) ORDER BY t
+            `;
+        }
+        return beforeMacrosQuery + sql;
     }
 
     // $delta(query)
