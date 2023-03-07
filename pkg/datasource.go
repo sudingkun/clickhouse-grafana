@@ -59,7 +59,7 @@ func (ds *ClickHouseDatasource) executeQuery(pluginContext backend.PluginContext
 		return onErr(err)
 	}
 
-	backend.Logger.Debug(fmt.Sprintf("queryResponse: %s returns %v frames", sql, len(frames)))
+	backend.Logger.Info(fmt.Sprintf("queryResponse: %s returns %v frames", sql, len(frames)))
 	return backend.DataResponse{
 		Frames: frames,
 	}

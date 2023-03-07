@@ -489,43 +489,76 @@ func (q *EvalQuery) irate(query string, ast *EvalAST) (string, error) {
 		return query, nil
 	}
 	var args = ast.Obj["$irate"].(*EvalAST).Arr
-	if args == nil || len(args) < 2 {
-		return "", fmt.Errorf("Amount of arguments must be > 1 for $irate func. Parsed arguments are: %v ", args)
+	var promQLLegend = ast.Obj["promQLLegend"]
+	var columns = ast.Obj["promQLColumns"].(*EvalAST).Arr
+	if args == nil || len(args) != 2 {
+		return "", fmt.Errorf("Amount of arguments must equal 2 for $irate func. Parsed arguments are: %v ", args)
 	}
 
-	return q._irate(args, beforeMacrosQuery, fromQuery)
+	return q._irate(args, promQLLegend.(string), columns, beforeMacrosQuery, fromQuery)
 }
 
-func (q *EvalQuery) _irate(args []interface{}, beforeMacrosQuery, fromQuery string) (string, error) {
+func (q *EvalQuery) _irate(args []interface{}, promQLLegend string, columns []interface{}, beforeMacrosQuery, fromQuery string) (string, error) {
 	args = args[:len(args)-1]
-	var aliases = make([]string, len(args))
-	var argsStr = make([]string, len(args))
-	for i, arg := range args {
-		str := arg.(string)
-		if str[len(str)-1] == ')' {
-			return "", fmt.Errorf("argument %v cant be used without alias", str)
-		}
-		argSplit := strings.Split(strings.Trim(str, " \xA0\t\r\n"), " ")
-		aliases[i] = argSplit[len(argSplit)-1]
-		argsStr[i] = arg.(string)
+	columnsStr := make([]string, len(columns))
+	for i, v := range columns {
+		columnsStr[i] = v.(string)
 	}
 
-	var cols []string
-	for _, a := range aliases {
-		cols = append(cols, "(("+a+" - neighbor("+a+",-1,"+a+"))/((t - neighbor(t,-1,1))/1000))"+a+"_iRate")
+	var col = args[0].(string)
+	if len(strings.Fields(col)) > 1 {
+		panic(fmt.Sprintf("Argument \"%s\" can't be used with alias", col))
 	}
-
 	fromQuery = q._applyTimeFilter(fromQuery)
-	return beforeMacrosQuery + "SELECT " +
-		"t," +
-		" " + strings.Join(cols, ", ") +
-		" FROM (" +
-		" SELECT $timeSeriesMs AS t" +
-		", " + strings.Join(argsStr, ", ") +
-		" " + fromQuery +
-		" GROUP BY t" +
-		" ORDER BY t" +
-		")", nil
+
+	var sql string
+	if promQLLegend != "" {
+		regex, _ := regexp.Compile("{{(.*?)}}")
+		var nameTags []string
+		keyName := promQLLegend
+		for _, match := range regex.FindAllStringSubmatch(promQLLegend, -1) {
+			column := match[1]
+			nameTags = append(nameTags, fmt.Sprintf("'%s', %s ", column, column))
+			keyName = strings.ReplaceAll(keyName, fmt.Sprintf("{{%s}}", column), fmt.Sprintf("',tags['%s']',''", column))
+		}
+		keyName = fmt.Sprintf("'%s'", keyName)
+		tags := strings.Join(nameTags, ", ")
+
+		sql = fmt.Sprintf(`
+            SELECT t,  array((concat(%s), abs((value - neighbor(value, -1, value)) / (t - neighbor(t,-1,1))) / 1000 ))
+            FROM (
+                SELECT t, tags, any(val) value FROM (
+                    SELECT $timeSeriesMs AS t,
+                    map(%s) tags,
+                    anyLast(%s)   val
+                    %v GROUP BY t, %v
+                ) GROUP BY t, tags
+                    ORDER BY tags, t
+            ) ORDER BY t
+        `, keyName, tags, col, fromQuery, columnsStr)
+	} else {
+		var columnsTags []string
+		for _, result := range columnsStr {
+			columnsTags = append(columnsTags, fmt.Sprintf("if(%s = '', '', concat('%s=\"', %s, '\"'))", result, result, result))
+		}
+		tags := strings.Join(columnsTags, ", ")
+
+		sql = fmt.Sprintf(`
+            SELECT t, array((tags, abs((value - neighbor(value, -1, value)) / (t - neighbor(t,-1,1))) / 1000 ))
+            FROM (
+                SELECT t, tags, any(val) value FROM (
+                    SELECT $timeSeriesMs AS t,
+                    array(%s)                                  allTags,
+                    arrayFilter(allTags -> allTags != '', allTags)  tags,
+                    anyLast(%s)   val
+                    %v GROUP BY t, %v
+                ) GROUP BY t, tags
+                    ORDER BY tags,t
+            ) ORDER BY t
+        `, tags, col, fromQuery, columnsStr)
+	}
+
+	return beforeMacrosQuery + sql, nil
 }
 
 func (q *EvalQuery) rate(query string, ast *EvalAST) (string, error) {
@@ -538,41 +571,77 @@ func (q *EvalQuery) rate(query string, ast *EvalAST) (string, error) {
 		return query, nil
 	}
 	var args = ast.Obj["$rate"].(*EvalAST).Arr
-	if args == nil || len(args) < 2 {
-		return "", fmt.Errorf("Amount of arguments must be > 1 for $rate func. Parsed arguments are: %v ", args)
+	var promQLLegend = ast.Obj["promQLLegend"]
+	var columns = ast.Obj["promQLColumns"].(*EvalAST).Arr
+
+	if args == nil || len(args) != 2 {
+		return "", fmt.Errorf("Amount of arguments must equal 2 for $rate func. Parsed arguments are: %v ", args)
 	}
 
-	return q._rate(args[:len(args)-1], args[len(args)-1].(string), beforeMacrosQuery, fromQuery)
+	return q._rate(args[:len(args)-1], args[len(args)-1].(string), promQLLegend.(string), columns, beforeMacrosQuery, fromQuery)
 }
 
-func (q *EvalQuery) _rate(args []interface{}, time, beforeMacrosQuery, fromQuery string) (string, error) {
-	var aliases = make([]string, len(args))
-	var argsStr = make([]string, len(args))
-	for i, arg := range args {
-		str := arg.(string)
-		if str[len(str)-1] == ')' {
-			return "", fmt.Errorf("argument %v cant be used without alias", str)
-		}
-		argSplit := strings.Split(strings.Trim(str, " \xA0\t\r\n"), " ")
-		aliases[i] = argSplit[len(argSplit)-1]
-		argsStr[i] = arg.(string)
+func (q *EvalQuery) _rate(args []interface{}, time, promQLLegend string, columns []interface{}, beforeMacrosQuery, fromQuery string) (string, error) {
+	columnsStr := make([]string, len(columns))
+	for i, v := range columns {
+		columnsStr[i] = v.(string)
 	}
 
-	var cols []string
-	for _, a := range aliases {
-		cols = append(cols, "(("+a+" - neighbor("+a+",-"+time+","+a+"))/((t - neighbor(t,-"+time+",1))/1000))"+a+"_Rate")
+	var col = args[0].(string)
+	if len(strings.Fields(col)) > 1 {
+		panic(fmt.Sprintf("Argument \"%s\" can't be used with alias", col))
 	}
-
 	fromQuery = q._applyTimeFilter(fromQuery)
-	return beforeMacrosQuery + "SELECT " +
-		"t," +
-		" " + strings.Join(cols, ", ") +
-		" FROM (" +
-		" SELECT $timeSeriesMs AS t" +
-		", " + strings.Join(argsStr, ", ") +
-		" " + fromQuery +
-		" ORDER BY t" +
-		")", nil
+
+	var sql string
+	if promQLLegend != "" {
+		regex, _ := regexp.Compile("{{(.*?)}}")
+		var nameTags []string
+		keyName := promQLLegend
+		for _, match := range regex.FindAllStringSubmatch(promQLLegend, -1) {
+			column := match[1]
+			nameTags = append(nameTags, fmt.Sprintf("'%s', %s ", column, column))
+			keyName = strings.ReplaceAll(keyName, fmt.Sprintf("{{%s}}", column), fmt.Sprintf("',tags['%s']',''", column))
+		}
+		keyName = fmt.Sprintf("'%s'", keyName)
+		tags := strings.Join(nameTags, ", ")
+
+		sql = fmt.Sprintf(`
+            SELECT t,  array((concat(%s), abs((value - neighbor(value, -%v, value)) / (t - neighbor(t,-%v,1))) / 1000 ))
+            FROM (
+                SELECT t, tags, any(val) value FROM (
+                    SELECT $timeSeriesMs AS t,
+                    map(%s) tags,
+                    anyLast(%s)   val
+                    %v GROUP BY t, %v
+                ) GROUP BY t, tags
+                    ORDER BY tags, t
+            ) ORDER BY t
+        `, keyName, time, time, tags, col, fromQuery, columnsStr)
+	} else {
+		var columnsTags []string
+		for _, result := range columnsStr {
+			columnsTags = append(columnsTags, fmt.Sprintf("if(%s = '', '', concat('%s=\"', %s, '\"'))", result, result, result))
+		}
+		tags := strings.Join(columnsTags, ", ")
+
+		sql = fmt.Sprintf(`
+            SELECT t, array((tags, abs((value - neighbor(value, -%v, value)) / (t - neighbor(t,-%v,1))) / 1000 ))
+            FROM (
+                SELECT t, tags, any(val) value FROM (
+                    SELECT $timeSeriesMs AS t,
+                    array(%s)                                  allTags,
+                    arrayFilter(allTags -> allTags != '', allTags)  tags,
+                    anyLast(%s)   val
+                    %v GROUP BY t, %v
+                ) GROUP BY t, tags
+                    ORDER BY tags,t
+            ) ORDER BY t
+        `, time, time, tags, col, fromQuery, columnsStr)
+	}
+
+	return beforeMacrosQuery + sql, nil
+
 }
 
 func (q *EvalQuery) perSecondColumns(query string, ast *EvalAST) (string, error) {
@@ -827,43 +896,75 @@ func (q *EvalQuery) increase(query string, ast *EvalAST) (string, error) {
 		return query, nil
 	}
 	var args = ast.Obj["$increase"].(*EvalAST).Arr
-	if len(args) < 2 {
-		return "", fmt.Errorf("amount of arguments must be > 1 for $increase func. Parsed arguments are: %v", args)
+	var promQLLegend = ast.Obj["promQLLegend"]
+	var columns = ast.Obj["promQLColumns"].(*EvalAST).Arr
+	if len(args) != 2 {
+		return "", fmt.Errorf("amount of arguments must equal 2 for $increase func. Parsed arguments are: %v", args)
 	}
 
-	return q._increase(args[:len(args)-1], args[len(args)-1].(string), beforeMacrosQuery, fromQuery)
+	return q._increase(args[:len(args)-1], args[len(args)-1].(string), promQLLegend.(string), columns, beforeMacrosQuery, fromQuery)
 }
 
-func (q *EvalQuery) _increase(args []interface{}, time, beforeMacrosQuery, fromQuery string) (string, error) {
-	var argsStr = make([]string, len(args))
-	var aliases = make([]string, len(args))
-
-	for i, arg := range args {
-		str := arg.(string)
-		if str[len(str)-1] == ')' {
-			return "", fmt.Errorf("argument %v cant be used without alias", str)
-		}
-		argSplit := strings.Split(strings.Trim(str, " \xA0\t\r\n"), " ")
-		aliases[i] = argSplit[len(argSplit)-1]
-		argsStr[i] = arg.(string)
+func (q *EvalQuery) _increase(args []interface{}, time, promQLLegend string, columns []interface{}, beforeMacrosQuery, fromQuery string) (string, error) {
+	columnsStr := make([]string, len(columns))
+	for i, v := range columns {
+		columnsStr[i] = v.(string)
 	}
 
-	var cols []string
-	for _, a := range aliases {
-		cols = append(cols, a+" - neighbor("+a+",-"+time+","+a+") "+a+"_Increase")
+	var col = args[0].(string)
+	if len(strings.Fields(col)) > 1 {
+		panic(fmt.Sprintf("Argument \"%s\" can't be used with alias", col))
 	}
-
 	fromQuery = q._applyTimeFilter(fromQuery)
-	return beforeMacrosQuery + "SELECT " +
-		"t," +
-		" " + strings.Join(cols, ", ") +
-		" FROM (" +
-		" SELECT $timeSeriesMs AS t," +
-		" " + strings.Join(argsStr, ", ") +
-		" " + fromQuery +
-		" GROUP BY t" +
-		" ORDER BY t" +
-		")", nil
+
+	var sql string
+	if promQLLegend != "" {
+		regex, _ := regexp.Compile("{{(.*?)}}")
+		var nameTags []string
+		keyName := promQLLegend
+		for _, match := range regex.FindAllStringSubmatch(promQLLegend, -1) {
+			column := match[1]
+			nameTags = append(nameTags, fmt.Sprintf("'%s', %s ", column, column))
+			keyName = strings.ReplaceAll(keyName, fmt.Sprintf("{{%s}}", column), fmt.Sprintf("',tags['%s']',''", column))
+		}
+		keyName = fmt.Sprintf("'%s'", keyName)
+		tags := strings.Join(nameTags, ", ")
+
+		sql = fmt.Sprintf(`
+            SELECT t,  array((concat(%s), abs(value - neighbor(value, -%v, value))))
+            FROM (
+                SELECT t, tags, any(val) value FROM (
+                    SELECT $timeSeriesMs AS t,
+                    map(%s) tags,
+                    anyLast(%s)   val
+                    %v GROUP BY t, %v
+                ) GROUP BY t, tags
+                    ORDER BY tags, t
+            ) ORDER BY t
+        `, keyName, time, tags, col, fromQuery, columnsStr)
+	} else {
+		var columnsTags []string
+		for _, result := range columnsStr {
+			columnsTags = append(columnsTags, fmt.Sprintf("if(%s = '', '', concat('%s=\"', %s, '\"'))", result, result, result))
+		}
+		tags := strings.Join(columnsTags, ", ")
+
+		sql = fmt.Sprintf(`
+            SELECT t, array((tags, abs((value - neighbor(value, -%v, value))))
+            FROM (
+                SELECT t, tags, any(val) value FROM (
+                    SELECT $timeSeriesMs AS t,
+                    array(%s)                                  allTags,
+                    arrayFilter(allTags -> allTags != '', allTags)  tags,
+                    anyLast(%s)   val
+                    %v GROUP BY t, %v
+                ) GROUP BY t, tags
+                    ORDER BY tags,t
+            ) ORDER BY t
+        `, time, tags, col, fromQuery, columnsStr)
+	}
+
+	return beforeMacrosQuery + sql, nil
 }
 
 func (q *EvalQuery) _applyTimeFilter(query string) string {
